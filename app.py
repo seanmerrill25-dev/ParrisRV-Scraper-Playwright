@@ -81,7 +81,7 @@ def run_coro_resilient(coro):
 
 
 # --------------------------
-# HTTP session (for metadata and parity; we DO NOT fetch details via requests to avoid 403)
+# HTTP session (for metadata; we DO NOT fetch details via requests to avoid 403)
 # --------------------------
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -653,10 +653,6 @@ async def fetch_disclaimers_on_page(context, url: str) -> dict:
                 };
                 const isDetail = (h) => /\\/product\\/used-/i.test(h || "");
                 // Collect candidate card nodes (anchor, button, card containers)
-                const cards = Array.from(document.querySelectorAll(
-                    ".inventory, .listing, .results, [data-href*='/product/'], a[href*='/product/used-']"
-                ));
-
                 const getDisclaimerNear = (node) => {
                     // search upward then nearby
                     let up = node, steps = 0;
@@ -682,12 +678,12 @@ async def fetch_disclaimers_on_page(context, url: str) -> dict:
                         if (dh) { try { url = new URL(dh, location.href).href; } catch {} }
                     }
                     if (!url) {
-                        const oc = el.getAttribute && el.getAttribute("onclick") || "";
+                        const oc = (el.getAttribute && el.getAttribute("onclick")) || "";
                         const m = oc && oc.match(/['\\"]([^'\\"]*\\/product\\/[^'\\"]+)['\\"]/);
                         if (m) { try { url = new URL(m[1], location.href).href; } catch {} }
                     }
                     if (!url) return;
-                    url = norm(url);
+                    try { url = norm(url) } catch { return; }
                     if (!url || !isDetail(url) || seen.has(url)) return;
                     seen.add(url);
                     const disclaimer = getDisclaimerNear(el);
@@ -792,8 +788,8 @@ async def collect_detail_urls_with_playwright(index_url: str, max_pages: int = 1
                             Array.from(document.querySelectorAll("a,button,[data-href]")).forEach(el => {
                                 const txt = (el.textContent || "").toLowerCase();
                                 const dh = el.getAttribute && el.getAttribute("data-href");
-                                const oc = el.getAttribute && el.getAttribute("onclick") || "";
-                                if (/view\\s+details/.test(txt) || (dh && /\\/product\\//.test(dh)) or (/\\/product\\//.test(oc || ""))) {
+                                const oc = (el.getAttribute && el.getAttribute("onclick")) || "";
+                                if (/view\\s+details/.test(txt) || (dh && /\\/product\\//.test(dh)) || /\\/product\\//.test(oc)) {
                                     if (el.href) out.add(el.href);
                                     if (dh) {
                                         try { out.add(new URL(dh, location.href).href); } catch {}
@@ -833,9 +829,12 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
     results = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir="/tmp/pw-parrisrv",
+            headless=True,
             user_agent=SESSION.headers.get("User-Agent", None),
             extra_http_headers={"Referer": referer} if referer else None,
+            viewport={"width": 1366, "height": 900},
         )
 
         async def route_handler(route):
