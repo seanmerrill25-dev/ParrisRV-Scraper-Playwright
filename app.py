@@ -32,8 +32,6 @@ import subprocess
 def _ensure_playwright_browser():
     """
     Try launching Chromium; if it fails, install it.
-    On Streamlit Cloud, a postSetup.sh can also run the install,
-    but this fallback helps locally and on fresh images.
     """
     try:
         async def _t():
@@ -59,15 +57,11 @@ if sys.platform.startswith("win"):
 
 def run_coro_resilient(coro):
     """
-    Run an async coroutine robustly under Streamlit/Windows:
-    - Try asyncio.run(...)
-    - If a loop is already running (RuntimeError), create a private loop and run_until_complete
-    - If the loop policy can't spawn subprocesses (NotImplementedError), switch to Proactor and retry
+    Run an async coroutine robustly under Streamlit/Windows.
     """
     try:
         return asyncio.run(coro)
     except RuntimeError:
-        # e.g. "asyncio.run() cannot be called from a running event loop"
         loop = asyncio.new_event_loop()
         try:
             if sys.platform.startswith("win"):
@@ -80,7 +74,6 @@ def run_coro_resilient(coro):
             except Exception:
                 pass
     except NotImplementedError:
-        # Wrong event loop policy (Windows Selector) -> switch to Proactor and retry
         if sys.platform.startswith("win"):
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
             return asyncio.run(coro)
@@ -518,10 +511,17 @@ def parse_detail_html(detail_url: str, html_text: str):
 # --------------------------
 # Playwright: listing-page auto-scroll + disclaimers
 # --------------------------
-async def autoscroll_until_stable(page, min_cycles=3, max_loops=40):
+async def autoscroll_until_stable(page, min_cycles=3, max_loops=60):
     async def count_links():
-        return await page.evaluate("() => document.querySelectorAll(\"a[href*='/product/used-']\").length")
-
+        # Count both product anchors and "View Details" CTAs
+        return await page.evaluate("""
+            () => {
+                const a1 = Array.from(document.querySelectorAll("a[href*='/product/']"));
+                const a2 = Array.from(document.querySelectorAll("a,button")).filter(el => /view\s+details/i.test(el.textContent || ""));
+                const hrefs = new Set(a1.map(a => a.href).concat(a2.map(el => el.href).filter(Boolean)));
+                return hrefs.size;
+            }
+        """)
     async def click_load_more_if_any():
         selectors = [
             "button:has-text('Load More')",
@@ -546,21 +546,28 @@ async def autoscroll_until_stable(page, min_cycles=3, max_loops=40):
                 pass
         return False
 
+    # Try to ensure the grid exists
+    for sel in ["[class*='listing']", ".inventory", ".inventory-grid", ".results", "main"]:
+        try:
+            await page.wait_for_selector(sel, timeout=2000)
+            break
+        except Exception:
+            pass
+
     stable = 0
     last = -1
     for _ in range(max_loops):
         await page.evaluate(
             """async () => {
                 const step = () => new Promise(r => {
-                    const y = window.scrollY + Math.max(400, window.innerHeight * 0.9);
-                    window.scrollTo({top: y, behavior: 'instant'});
-                    setTimeout(r, 180);
+                    window.scrollBy(0, Math.max(600, innerHeight * 0.95));
+                    setTimeout(r, 140);
                 });
-                for (let i = 0; i < 8; i++) await step();
+                for (let i = 0; i < 10; i++) await step();
             }"""
         )
         try:
-            await page.wait_for_load_state("networkidle", timeout=3000)
+            await page.wait_for_load_state("networkidle", timeout=2500)
         except PWTimeout:
             pass
 
@@ -664,11 +671,10 @@ async def fetch_disclaimers_across_pages(listing_url: str, max_pages: int = 12) 
         try:
             for page in range(1, max_pages + 1):
                 url = listing_url if page == 1 else (
-                    f"{listing_url}&page={page}" if "page=" not in listing_url else listing_url
+                    f"{listing_url}&page={page}" if "page=" not in listing_url else listing_url.replace(re.search(r'(?:[?&])page=\d+', listing_url).group(0), f'?page={page}') if re.search(r'(?:[?&])page=\d+', listing_url) else listing_url
                 )
                 disc = await fetch_disclaimers_on_page(context, url)
                 out.update(disc)
-                # Heuristic: stop early if we stopped getting new items
                 if page > 1 and not disc:
                     break
         finally:
@@ -683,13 +689,11 @@ def _filter_detail_urls(urls):
     cleaned = set()
     for u in urls:
         u = strip_fragment(u)
-        # Proper quoting (fixed bug)
         if any(x in u for x in [' "', "'"]):
             continue
         parsed = urlparse(u)
         if "parrisrv.com" not in parsed.netloc or "/product/" not in parsed.path:
             continue
-        # exclude category pages; keep actual units
         if re.search(r"/product/[^/]+/used/?$", parsed.path, re.I):
             continue
         cleaned.add(u)
@@ -706,23 +710,30 @@ async def collect_detail_urls_with_playwright(index_url: str, max_pages: int = 1
         try:
             all_urls = set()
             for page_num in range(1, max_pages + 1):
-                url = index_url if page_num == 1 else (
-                    f"{index_url}&page={page_num}" if "page=" not in index_url else index_url
-                )
+                if "page=" in index_url:
+                    # Replace existing page param with current
+                    url = re.sub(r"([?&])page=\d+", rf"\g<1>page={page_num}", index_url)
+                else:
+                    url = index_url if page_num == 1 else f"{index_url}&page={page_num}"
+
                 page = await context.new_page()
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     await autoscroll_until_stable(page)
-                    # collect all /product/ anchors (matches previous Selenium behavior)
+                    # collect product anchors and explicit "View Details" CTAs
                     urls = await page.eval_on_selector_all(
                         "a[href*='/product/']",
                         "els => els.map(a => a.href)"
                     )
-                    urls = _filter_detail_urls(urls or [])
+                    ctas = await page.eval_on_selector_all(
+                        "a:has-text('View Details'), button:has-text('View Details')",
+                        "els => els.map(el => el.href).filter(Boolean)"
+                    )
+                    urls = (urls or []) + (ctas or [])
+                    urls = _filter_detail_urls(urls)
                     before = len(all_urls)
                     all_urls |= urls
                     if page_num > 1 and len(all_urls) == before:
-                        # no growth on subsequent pages -> break (same heuristic as before)
                         break
                 finally:
                     await page.close()
@@ -735,10 +746,6 @@ async def collect_detail_urls_with_playwright(index_url: str, max_pages: int = 1
 # Fetch detail pages HTML with Playwright (prevents 403 & waits for content)
 # --------------------------
 async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = "") -> dict:
-    """
-    Visit each detail URL with Playwright and return {url -> page_html}.
-    We block images/css/fonts to keep it fast. We also wait for late JS content.
-    """
     results = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -747,7 +754,6 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
             extra_http_headers={"Referer": referer} if referer else None,
         )
 
-        # Block heavy assets for speed
         async def route_handler(route):
             rtype = route.request.resource_type
             if rtype in ("image", "media", "font", "stylesheet"):
@@ -758,7 +764,6 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
         page = await context.new_page()
 
         async def ensure_loaded():
-            # A sequence of cheap “are we ready yet?” heuristics: titles, prices, main content.
             sels = [
                 "h1, h2, .product-title",
                 ".price, .our-price, .sale-price, [class*='price']",
@@ -771,7 +776,6 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
                     await page.wait_for_selector(sel, timeout=2000)
                 except Exception:
                     pass
-            # small scroll bursts to trigger lazy content
             try:
                 await page.evaluate("""async () => {
                     const step = () => new Promise(r => {
@@ -783,7 +787,6 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
                 }""")
             except Exception:
                 pass
-            # one more idle wait
             try:
                 await page.wait_for_load_state("networkidle", timeout=3000)
             except Exception:
@@ -825,7 +828,6 @@ def process_one(u, html_text, disc_map):
         if html_text:
             row = parse_detail_html(u, html_text)
         else:
-            # try requests fallback once
             try:
                 html_text = fetch_detail_html(u)
                 row = parse_detail_html(u, html_text)
@@ -838,10 +840,7 @@ def process_one(u, html_text, disc_map):
                     "image_url": "",
                 }
 
-        # Normalize title once more
         row["title"] = strip_used_prefix(row.get("title", ""))
-
-        # Merge listing-card disclaimer (by normalized URL)
         row["payments_disclaimer"] = disc_map.get(strip_fragment(u), "")
         return row
     except Exception as e:
@@ -857,18 +856,14 @@ def process_one(u, html_text, disc_map):
         }
 
 def run_scrape(listing_url: str, max_pages: int = 12) -> pd.DataFrame:
-    # 1) Collect detail URLs with Playwright
     detail_urls = run_coro_resilient(collect_detail_urls_with_playwright(listing_url, max_pages=max_pages))
     st.write(f"Found **{len(detail_urls)}** detail URLs across pages.")
 
-    # 2) Grab listing-card disclaimers via Playwright (multi-page)
     disc_map = run_coro_resilient(fetch_disclaimers_across_pages(listing_url, max_pages=max_pages))
     st.write(f"Captured **{sum(1 for v in disc_map.values() if v)}** payment disclaimers from listing cards.")
 
-    # 3) Fetch detail pages HTML with Playwright (prevents 403 & waits for content)
     html_map = run_coro_resilient(fetch_detail_pages_html_with_playwright(detail_urls, referer=listing_url))
 
-    # 4) Assemble rows
     rows = []
     for i, u in enumerate(detail_urls, start=1):
         row = process_one(u, html_map.get(u, ""), disc_map)
@@ -876,7 +871,6 @@ def run_scrape(listing_url: str, max_pages: int = 12) -> pd.DataFrame:
         if i % 10 == 0:
             st.write(f"Processed {i}/{len(detail_urls)}")
 
-    # 5) Build DataFrame (WITHOUT detail_url column)
     cols = ["title", "tagline", "list_price", "payments_from", "payments_disclaimer", "image_url"]
     for r in rows:
         for k in cols:
