@@ -1,11 +1,20 @@
 # app.py
 # Streamlit UI for ParrisRV list-page scraper (Playwright-only, Streamlit Cloud friendly)
+# - One input: listing URL (the page with the grid of units)
+# - Outputs: title, tagline, list_price, payments_from, payments_disclaimer, image_url, detail_url
+# - Removes leading "Used" from titles
+# - payments_from is just the dollar amount (e.g., "$205")
+# - Payment disclaimers captured from the listing cards via Playwright (async) across pages
+# - Robust image extraction + tagline extraction w/ "Sleeps X!" edge-case bypass
+# - Windows/Streamlit safe: Proactor loop + resilient coroutine runner
+# - Retries on InteractRV "OOPS!" pages; throttles requests; keeps plausible rows
 
 import sys
 import re
 import html
 import asyncio
 import traceback
+import random
 from urllib.parse import urlparse, urljoin
 
 import pandas as pd
@@ -127,6 +136,10 @@ def is_floorplan_or_virtual_from_strings(*strings) -> bool:
             parts.append(safe_lower(s))
     blob = " ".join(parts)
     return any(k in blob for k in ["floorplan", "floor plan", "virtual", "tour", "360"])
+
+def looks_like_oops_html(html_text: str) -> bool:
+    t = (html_text or "").lower()
+    return ("oops! we had a problem loading this page" in t) or ("our support team has been notified" in t)
 
 def pick_from_srcset(srcset: str) -> str:
     if not srcset:
@@ -473,7 +486,7 @@ def parse_detail_html(detail_url: str, html_text: str):
     }
 
 # ---------- Playwright utils ----------
-async def autoscroll_until_stable(page, min_cycles=4, max_loops=140):
+async def autoscroll_until_stable(page, min_cycles=5, max_loops=200):
     async def count_links():
         return await page.evaluate("""
             () => {
@@ -638,10 +651,8 @@ def _looks_like_product_detail(u: str) -> bool:
             return False
         if re.search(r"\.(?:jpg|jpeg|png|webp|svg)$", path):
             return False
-        # Exclude category index like '/product/used'
         if re.fullmatch(r"/product/used/?", path):
             return False
-        # Require at least two dashes after "used-" to weed out thin slugs
         m = re.search(r"/product/used-[^/]+", path)
         if not m or m.group(0).count("-") < 2:
             return False
@@ -706,9 +717,14 @@ async def collect_detail_urls_with_playwright(index_url: str, max_pages: int = 1
         finally:
             await browser.close()
 
-# ---------- fetch detail HTML ----------
+# ---------- fetch detail HTML with retries/throttling ----------
 async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = "") -> dict:
     results = {}
+    RATE_DELAY_RANGE = (0.8, 1.6)      # seconds between hits
+    MAX_TRIES = 3
+    SLOW_WAIT = 1200                   # ms extra after load when retrying
+    LONG_WAIT = 2500
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await p.chromium.launch_persistent_context(
@@ -719,44 +735,62 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
             viewport={"width": 1366, "height": 900},
         )
 
+        # Allow stylesheets; block heavy assets
         async def route_handler(route):
             rtype = route.request.resource_type
-            if rtype in ("image", "media", "font", "stylesheet"):
+            if rtype in ("image", "media", "font"):
                 return await route.abort()
             return await route.continue_()
         await context.route("**/*", route_handler)
 
         page = await context.new_page()
 
-        async def ensure_loaded():
+        async def ensure_loaded(extra_wait_ms=0):
             sels = [
                 "h1, h2, .product-title, [itemprop='name']",
+                ".specifications, .rv-specs, .vehicle-specs, .product-specs",
                 ".price, .our-price, .sale-price, [class*='price'], [id*='price']",
-                "[class*='payment'], [id*='payment']",
-                ".content, main, [role='main']"
+                "[class*='payment'], [id*='payment'], .finance, .cta, .summary",
+                ".gallery, .media, .images"
             ]
             for sel in sels:
-                try: await page.wait_for_selector(sel, timeout=2500)
-                except Exception: pass
+                try:
+                    await page.wait_for_selector(sel, timeout=LONG_WAIT)
+                except Exception:
+                    pass
             try:
-                await page.evaluate("""async () => {
-                    const step = () => new Promise(r => { window.scrollBy(0, Math.max(400, innerHeight*0.9)); setTimeout(r, 120); });
-                    for (let i=0;i<8;i++) await step(); window.scrollTo(0,0);
-                }""")
+                await page.wait_for_load_state("networkidle", timeout=LONG_WAIT)
             except Exception:
                 pass
-            try: await page.wait_for_load_state("networkidle", timeout=3500)
-            except Exception: pass
-            await page.wait_for_timeout(150)
+            if extra_wait_ms:
+                await page.wait_for_timeout(extra_wait_ms)
 
         try:
             for url in detail_urls:
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    await ensure_loaded()
-                    results[url] = await page.content()
-                except Exception:
-                    results[url] = ""
+                html_text = ""
+                for attempt in range(1, MAX_TRIES + 1):
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        await ensure_loaded(extra_wait_ms=(SLOW_WAIT if attempt > 1 else 0))
+                        html_text = await page.content()
+
+                        # Retry if InteractRV’s OOPS page or suspiciously short page
+                        if looks_like_oops_html(html_text) or len((html_text or "")) < 5000:
+                            if attempt < MAX_TRIES:
+                                await page.wait_for_timeout(400 + attempt * 400)
+                                continue
+                        break
+                    except Exception:
+                        if attempt == MAX_TRIES:
+                            html_text = ""
+                        else:
+                            await page.wait_for_timeout(400 + attempt * 400)
+                            continue
+
+                results[url] = html_text
+
+                # polite throttling
+                await page.wait_for_timeout(int(1000 * random.uniform(*RATE_DELAY_RANGE)))
         finally:
             await page.close()
             await context.close()
@@ -765,25 +799,33 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
     return results
 
 # ---------- row validation ----------
-def is_valid_row(row: dict) -> (bool, str):
+def is_valid_row(row: dict) -> tuple[bool, str]:
     title = (row.get("title") or "").strip()
-    price = (row.get("list_price") or "").strip()
     img = (row.get("image_url") or "").strip()
-    # obvious error pages
+    pay = (row.get("payments_from") or "").strip()
+    price = (row.get("list_price") or "").strip()
+
+    # Drop obvious error/blank rows
     if not title or "oops" in title.lower():
         return False, "empty_or_error_title"
-    # junk "used" only or pure numbers
     if title.lower() in {"used", '""",""used"'}:
         return False, "junk_title"
-    # must have at least one of {price, img, payments_from}
-    if not price and not img and not (row.get("payments_from") or "").strip():
-        return False, "no_price_img_payments"
-    return True, ""
+
+    # Keep if we have *any* strong signal that this is a real detail page:
+    # title length + (image OR any money OR a payments disclaimer) is enough.
+    if len(title) >= 6 and (img or price or pay or (row.get("payments_disclaimer") or "").strip()):
+        return True, ""
+
+    # Otherwise keep if plausible title and detail_url pattern (weak but useful for debugging)
+    if len(title) >= 10 and (row.get("detail_url") or "").startswith("https://www.parrisrv.com/product/"):
+        return True, "weak-signals"
+
+    return False, "no_strong_signals"
 
 # ---------- assembly ----------
 def process_one(u, html_text, disc_map):
     try:
-        if html_text:
+        if html_text and not looks_like_oops_html(html_text):
             row = parse_detail_html(u, html_text)
         else:
             row = {
@@ -796,9 +838,10 @@ def process_one(u, html_text, disc_map):
         row["title"] = strip_used_prefix(row.get("title", ""))
         row["payments_disclaimer"] = disc_map.get(strip_fragment(u), "")
         row["detail_url"] = u
+
         ok, reason = is_valid_row(row)
         row["__status__"] = "ok" if ok else "dropped"
-        row["__error__"] = "" if ok else reason
+        row["__error__"] = "" if ok else (reason or ("oops_page" if looks_like_oops_html(html_text) else "unknown"))
         return row
     except Exception as e:
         return {
@@ -829,11 +872,11 @@ def run_scrape(listing_url: str, max_pages: int = 12) -> pd.DataFrame:
         if i % 10 == 0:
             st.write(f"Processed {i}/{len(detail_urls)}")
 
-    # Split into kept vs dropped
-    kept = [r for r in rows if r.get("__status__") == "ok"]
-    dropped = [r for r in rows if r.get("__status__") != "ok"]
+    # Keep strong rows and weak-signals rows; drop obvious junk
+    kept = [r for r in rows if r.get("__status__") == "ok" or r.get("__error__") == "weak-signals"]
+    dropped = [r for r in rows if r not in kept]
 
-    st.info(f"Kept {len(kept)} rows; dropped {len(dropped)} (clearly non-product or error pages).")
+    st.info(f"Kept {len(kept)} rows; dropped {len(dropped)} (non-product, error, or too-weak).")
 
     cols = ["title","tagline","list_price","payments_from","payments_disclaimer","image_url","detail_url","__status__","__error__"]
     for r in kept:
@@ -854,7 +897,7 @@ col_btn, col_info = st.columns([1, 3])
 with col_btn:
     go = st.button("Run scrape", type="primary")
 with col_info:
-    st.write("Output: **title**, **tagline**, **list_price**, **payments_from**, **payments_disclaimer**, **image_url**, **detail_url**")
+    st.write("Output columns: **title**, **tagline**, **list_price**, **payments_from**, **payments_disclaimer**, **image_url**, **detail_url**")
 
 if go:
     try:
