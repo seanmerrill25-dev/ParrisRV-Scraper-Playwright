@@ -101,15 +101,18 @@ SESSION.headers.update({
 # --------------------------
 def clean_text(t):
     try:
-        return re.sub(r"\\s+", " ", t or "").strip()
+        return re.sub(r"\s+", " ", t or "").strip()
     except Exception:
         return ""
+
 
 def safe_get_attr(tag, attr, default=""):
     return tag.get(attr) if hasattr(tag, "get") else default
 
+
 def safe_lower(s):
     return s.lower() if isinstance(s, str) else ""
+
 
 def strip_fragment(u: str) -> str:
     """Remove #fragment and trailing punctuation; normalize trailing slash."""
@@ -118,9 +121,11 @@ def strip_fragment(u: str) -> str:
     u = html.unescape(u or "").split("#", 1)[0].rstrip(").,;")
     return u[:-1] if u.endswith("/") else u
 
+
 def strip_used_prefix(title: str) -> str:
     """Remove leading 'Used', 'USED', 'Used:' or 'Used -' at the very start."""
-    return re.sub(r'^\\s*used\\s*[:\\-]?\\s*', '', title or '', flags=re.I)
+    return re.sub(r'^\s*used\s*[:\-]?\s*', '', title or '', flags=re.I)
+
 
 def is_floorplan_or_virtual_from_strings(*strings) -> bool:
     parts = []
@@ -132,6 +137,7 @@ def is_floorplan_or_virtual_from_strings(*strings) -> bool:
     blob = " ".join(parts)
     return any(k in blob for k in ["floorplan", "floor plan", "virtual", "tour", "360"])
 
+
 def pick_from_srcset(srcset: str) -> str:
     """Choose the largest width entry from a srcset."""
     if not srcset:
@@ -139,7 +145,7 @@ def pick_from_srcset(srcset: str) -> str:
     items = []
     for part in srcset.split(","):
         part = part.strip()
-        m = re.match(r"(\\S+)\\s+(\\d+)w", part)
+        m = re.match(r"(\S+)\s+(\d+)w", part)
         if m:
             url, w = m.group(1), int(m.group(2))
             items.append((w, url))
@@ -151,6 +157,7 @@ def pick_from_srcset(srcset: str) -> str:
         return ""
     items.sort(key=lambda x: x[0], reverse=True)
     return items[0][1]
+
 
 def pick_img_url(img_tag) -> str:
     if not hasattr(img_tag, "get"):
@@ -172,11 +179,12 @@ def _closest_amount_after_label(container_text: str, label_regex: re.Pattern, re
         return ""
     start = mlab.end()
     if require_mo:
-        m = re.search(r"\\$\\s*[\\d,]+(?:\\.\\d{2})?\\s*(?=/\\s*mo\\.?)", t[start:], flags=re.I)
+        m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?\s*(?=/\s*mo\.?)", t[start:], flags=re.I)
         return m.group(0).replace(" ", "") if m else ""
     else:
-        m = re.search(r"\\$\\s*[\\d,]+(?:\\.\\d{2})?", t[start:])
+        m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?", t[start:])
         return m.group(0).replace(" ", "") if m else ""
+
 
 def amount_near_label(soup, labels, mo_suffix=False):
     BLOCKLIST = ("disclaimer", "fine", "footnote", "legal", "terms", "finance")
@@ -210,11 +218,11 @@ def amount_near_label(soup, labels, mo_suffix=False):
 
             # fallback: pick the largest $ in this box (with /mo when needed)
             candidates = []
-            for m in re.finditer(r"\\$\\s*[\\d,]+(?:\\.\\d{2})?", text):
+            for m in re.finditer(r"\$\s*[\d,]+(?:\.\d{2})?", text):
                 val = m.group(0).replace(" ", "")
                 if mo_suffix:
                     after = text[m.end(): m.end()+20]
-                    if not re.search(r"/\\s*mo\\.?", after, re.I):
+                    if not re.search(r"/\s*mo\.?", after, re.I):
                         continue
                 candidates.append(val)
             if candidates:
@@ -241,12 +249,12 @@ def extract_tagline(soup, name_text: str) -> str:
                     continue
                 low = safe_lower(txt)
 
-                # Allow "Sleeps X!" edge-case
-                if re.fullmatch(r"sleeps\\s+\\d+\\s*!", low, flags=re.I):
+                # Allow "Sleeps X!" as an explicit edge-case, even though "sleeps" is usually blacklisted
+                if re.fullmatch(r"sleeps\s+\d+\s*!", low, flags=re.I):
                     return txt
 
                 if any(k in low for k in [
-                    "stock #", "length", "location", "sleeps",
+                    "stock #", "length", "location", "sleeps",  # <- normally blacklisted
                     "list price", "sale price", "from:", "payment", "msrp",
                     "photos", "floorplan", "tour", "description", "specifications",
                     "contact", "call", "view", "video"
@@ -266,11 +274,11 @@ def extract_tagline(soup, name_text: str) -> str:
             low = safe_lower(txt)
 
             # Allow "Sleeps X!" edge-case
-            if re.fullmatch(r"sleeps\\s+\\d+\\s*!", low, flags=re.I):
+            if re.fullmatch(r"sleeps\s+\d+\s*!", low, flags=re.I):
                 return txt
 
             if any(k in low for k in [
-                "stock #", "length", "location", "sleeps",
+                "stock #", "length", "location", "sleeps",  # <- normally blacklisted
                 "list price", "sale price", "from:", "payment", "msrp",
                 "photos", "floorplan", "tour", "description", "specifications",
                 "contact", "call", "view", "video"
@@ -289,8 +297,8 @@ def extract_tagline(soup, name_text: str) -> str:
             return plain[0]
 
     # fallback: first short non-spec line after the title in global text
-    full_text = (soup.get_text("\\n") or "").replace("\\xa0", " ")
-    lines = [ln.strip() for ln in full_text.split("\\n") if ln.strip()]
+    full_text = (soup.get_text("\n") or "").replace("\xa0", " ")
+    lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
     if name_text and name_text in lines:
         i = lines.index(name_text)
         for j in range(i + 1, min(i + 15, len(lines))):
@@ -298,11 +306,11 @@ def extract_tagline(soup, name_text: str) -> str:
             low = safe_lower(cand)
 
             # Allow "Sleeps X!" edge-case
-            if re.fullmatch(r"sleeps\\s+\\d+\\s*!", low, flags=re.I):
+            if re.fullmatch(r"sleeps\s+\d+\s*!", low, flags=re.I):
                 return cand
 
             if any(k in low for k in [
-                "stock #", "length", "location", "sleeps",
+                "stock #", "length", "location", "sleeps",  # <- normally blacklisted
                 "msrp", "list price", "sale price", "from:", "monthly", "payment",
                 "photos", "floorplan", "tour", "description", "specifications",
                 "contact", "call", "view", "video"
@@ -322,7 +330,7 @@ IMG_BLACKLIST_KEYWORDS = (
 )
 
 def is_real_image(url: str) -> bool:
-    return bool(re.search(r"\\.(jpe?g|png|webp)(\\?.*)?$", url, re.I))
+    return bool(re.search(r"\.(jpe?g|png|webp)(\?.*)?$", url, re.I))
 
 def is_blacklisted(url_or_alt: str) -> bool:
     u = safe_lower(url_or_alt)
@@ -378,7 +386,7 @@ def extract_main_image(soup: BeautifulSoup, detail_url: str) -> str:
     # 4) background-image / data-* image attributes
     for el in soup.find_all(True):
         style = safe_get_attr(el, "style", "")
-        for m in re.finditer(r"url\\((['\\\"]?)([^)'\"]+)\\1\\)", style or "", re.I):
+        for m in re.finditer(r"url\((['\"]?)([^)'\"]+)\1\)", style or "", re.I):
             url = urljoin(detail_url, m.group(2))
             if is_real_image(url) and not is_blacklisted(url):
                 return url
@@ -408,7 +416,7 @@ def extract_main_image(soup: BeautifulSoup, detail_url: str) -> str:
 
     # 6) inline scripts/JSON
     html_text = str(soup)
-    for m in re.finditer(r"https?://[^\\s\\\"'<>]+?\\.(?:jpe?g|png|webp)(?:\\?[^\\s\\\"'<>]*)?", html_text, re.I):
+    for m in re.finditer(r"https?://[^\s\"'<>]+?\.(?:jpe?g|png|webp)(?:\?[^\s\"'<>]*)?", html_text, re.I):
         url = m.group(0)
         if not is_blacklisted(url) and "logo" not in url.lower() and "floorplan" not in url.lower():
             return url
@@ -431,12 +439,12 @@ def parse_detail_html(detail_url: str, html_text: str):
     tagline = extract_tagline(soup, raw_title)
 
     # Prices / payments
-    list_price = amount_near_label(soup, [r"\\bList\\s*Price\\b", r"\\bMSRP\\b", r"\\bSale\\s*Price\\b"], mo_suffix=False)
-    payments_from = amount_near_label(soup, [r"\\bPayments?\\s*From\\b", r"\\bFrom:\\b"], mo_suffix=True)
+    list_price = amount_near_label(soup, [r"\bList\s*Price\b", r"\bMSRP\b", r"\bSale\s*Price\b"], mo_suffix=False)
+    payments_from = amount_near_label(soup, [r"\bPayments?\s*From\b", r"\bFrom:\b"], mo_suffix=True)
 
     # Reduce payment to just the $ amount (no "/mo")
     if payments_from:
-        m = re.search(r"\\$\\s*[\\d,]+(?:\\.\\d{2})?", payments_from)
+        m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?", payments_from)
         payments_from = m.group(0).replace(" ", "") if m else ""
 
     # Image
@@ -456,7 +464,7 @@ def parse_detail_html(detail_url: str, html_text: str):
 # --------------------------
 async def autoscroll_until_stable(page, min_cycles=3, max_loops=40):
     async def count_links():
-        return await page.evaluate("() => document.querySelectorAll(\\\"a[href*='/product/used-']\\\").length")
+        return await page.evaluate("() => document.querySelectorAll(\"a[href*='/product/used-']\").length")
 
     async def click_load_more_if_any():
         selectors = [
@@ -579,7 +587,7 @@ async def fetch_disclaimers_on_page(context, url: str) -> dict:
         for r in records or []:
             u = strip_fragment(r.get("url", ""))
             if u:
-                disc_map[u] = (r.get("disclaimer") or "").replace("\\u00a0", " ").strip()
+                disc_map[u] = (r.get("disclaimer") or "").replace("\u00a0", " ").strip()
     finally:
         await page.close()
     return disc_map
@@ -602,6 +610,7 @@ async def fetch_disclaimers_across_pages(listing_url: str, max_pages: int = 12) 
                 )
                 disc = await fetch_disclaimers_on_page(context, url)
                 out.update(disc)
+                # Heuristic: stop early if we stopped getting new items
                 if page > 1 and not disc:
                     break
         finally:
@@ -610,19 +619,20 @@ async def fetch_disclaimers_across_pages(listing_url: str, max_pages: int = 12) 
 
 
 # --------------------------
-# NEW: Playwright collection of detail URLs (replaces Selenium)
+# Playwright collection of detail URLs (replaces Selenium)
 # --------------------------
 def _filter_detail_urls(urls):
     cleaned = set()
     for u in urls:
         u = strip_fragment(u)
-        if any(x in u for x in [' \"', \"'\"]):
+        # FIXED LINE BELOW: proper quoting
+        if any(x in u for x in [' "', "'"]):
             continue
         parsed = urlparse(u)
         if "parrisrv.com" not in parsed.netloc or "/product/" not in parsed.path:
             continue
         # exclude category pages; keep actual units
-        if re.search(r\"/product/[^/]+/used/?$\", parsed.path, re.I):
+        if re.search(r"/product/[^/]+/used/?$", parsed.path, re.I):
             continue
         cleaned.add(u)
     return cleaned
@@ -631,24 +641,24 @@ async def collect_detail_urls_with_playwright(index_url: str, max_pages: int = 1
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            user_agent=(\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        \"AppleWebKit/537.36 (KHTML, like Gecko) "
-                        \"Chrome/120.0.0.0 Safari/537.36\")
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36")
         )
         try:
             all_urls = set()
             for page_num in range(1, max_pages + 1):
                 url = index_url if page_num == 1 else (
-                    f\"{index_url}&page={page_num}\" if \"page=\" not in index_url else index_url
+                    f"{index_url}&page={page_num}" if "page=" not in index_url else index_url
                 )
                 page = await context.new_page()
                 try:
-                    await page.goto(url, wait_until=\"domcontentloaded\", timeout=60000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     await autoscroll_until_stable(page)
                     # collect all /product/ anchors (matches previous Selenium behavior)
                     urls = await page.eval_on_selector_all(
-                        \"a[href*='/product/']\",
-                        \"els => els.map(a => a.href)\"
+                        "a[href*='/product/']",
+                        "els => els.map(a => a.href)"
                     )
                     urls = _filter_detail_urls(urls or [])
                     before = len(all_urls)
@@ -681,91 +691,91 @@ def process_one(url):
     try:
         html_text = fetch_detail_html(url)
         row = parse_detail_html(url, html_text)
-        if not row.get(\"title\"):
+        if not row.get("title"):
             try:
-                soup = BeautifulSoup(html_text, \"html.parser\")
-                t = clean_text(getattr(soup.find(\"title\"), \"get_text\", lambda: \"\")())
-                row[\"title\"] = strip_used_prefix(t or url.split(\"/\")[-1].replace(\"-\", \" \"))
+                soup = BeautifulSoup(html_text, "html.parser")
+                t = clean_text(getattr(soup.find("title"), "get_text", lambda: "")())
+                row["title"] = strip_used_prefix(t or url.split("/")[-1].replace("-", " "))
             except Exception:
-                row[\"title\"] = strip_used_prefix(url.split(\"/\")[-1].replace(\"-\", \" \"))
+                row["title"] = strip_used_prefix(url.split("/")[-1].replace("-", " "))
         else:
-            row[\"title\"] = strip_used_prefix(row[\"title\"])
+            row["title"] = strip_used_prefix(row["title"])
 
-        row[\"detail_url\"] = strip_fragment(url)
+        row["detail_url"] = strip_fragment(url)
         return row
     except Exception as e:
-        print(f\"  ! Error on {url}: {e.__class__.__name__}: {e}\")
+        print(f"  ! Error on {url}: {e.__class__.__name__}: {e}")
         traceback.print_exc(limit=1)
         return {
-            \"title\": strip_used_prefix(url.split(\"/\")[-1].replace(\"-\", \" \")),
-            \"tagline\": \"\",
-            \"list_price\": \"\",
-            \"payments_from\": \"\",
-            \"image_url\": \"\",
-            \"detail_url\": strip_fragment(url),
+            "title": strip_used_prefix(url.split("/")[-1].replace("-", " ")),
+            "tagline": "",
+            "list_price": "",
+            "payments_from": "",
+            "image_url": "",
+            "detail_url": strip_fragment(url),
         }
 
 def run_scrape(listing_url: str, max_pages: int = 12) -> pd.DataFrame:
     # 1) Collect detail URLs with Playwright
     detail_urls = run_coro_resilient(collect_detail_urls_with_playwright(listing_url, max_pages=max_pages))
-    st.write(f\"Found **{len(detail_urls)}** detail URLs across pages.\")
+    st.write(f"Found **{len(detail_urls)}** detail URLs across pages.")
 
     # 2) Grab listing-card disclaimers via Playwright (multi-page)
     disc_map = run_coro_resilient(fetch_disclaimers_across_pages(listing_url, max_pages=max_pages))
-    st.write(f\"Captured **{sum(1 for v in disc_map.values() if v)}** payment disclaimers from listing cards.\")
+    st.write(f"Captured **{sum(1 for v in disc_map.values() if v)}** payment disclaimers from listing cards.")
 
     # 3) Fetch detail pages and assemble rows (simple loop to avoid threading issues inside Streamlit)
     rows = []
     for i, u in enumerate(detail_urls, start=1):
         row = process_one(u)
         # Merge listing-card disclaimer (by normalized URL)
-        row[\"payments_disclaimer\"] = disc_map.get(row[\"detail_url\"], \"\")
+        row["payments_disclaimer"] = disc_map.get(row["detail_url"], "")
         rows.append(row)
         if i % 10 == 0:
-            st.write(f\"Processed {i}/{len(detail_urls)}\")
+            st.write(f"Processed {i}/{len(detail_urls)}")
 
     # 4) Build DataFrame (WITHOUT detail_url column)
-    cols = [\"title\", \"tagline\", \"list_price\", \"payments_from\", \"payments_disclaimer\", \"image_url\"]
+    cols = ["title", "tagline", "list_price", "payments_from", "payments_disclaimer", "image_url"]
     for r in rows:
         for k in cols:
-            r.setdefault(k, \"\")
-    df = pd.DataFrame([{k: r.get(k, \"\") for k in cols} for r in rows])
+            r.setdefault(k, "")
+    df = pd.DataFrame([{k: r.get(k, "") for k in cols} for r in rows])
     return df
 
 
 # --------------------------
 # Streamlit UI
 # --------------------------
-st.set_page_config(page_title=\"ParrisRV Scraper\", page_icon=\"🧹\", layout=\"wide\")
+st.set_page_config(page_title="ParrisRV Scraper", page_icon="🧹", layout="wide")
 
-st.title(\"ParrisRV Listing Scraper\")
-st.caption(\"Enter a listing URL (the page that shows the grid of units). The app will scrape detail pages and fetch per-card payment disclaimers.\")
+st.title("ParrisRV Listing Scraper")
+st.caption("Enter a listing URL (the page that shows the grid of units). The app will scrape detail pages and fetch per-card payment disclaimers.")
 
-default_url = \"https://www.parrisrv.com/used-rvs-for-sale?s=true&lots=1232&pagesize=72&sort=year-asc\"
-listing_url = st.text_input(\"Listing URL\", value=default_url, help=\"Example: a 'used-rvs-for-sale' page with pagesize & sort\")
+default_url = "https://www.parrisrv.com/used-rvs-for-sale?s=true&lots=1232&pagesize=72&sort=year-asc"
+listing_url = st.text_input("Listing URL", value=default_url, help="Example: a 'used-rvs-for-sale' page with pagesize & sort")
 
 col_btn, col_info = st.columns([1, 3])
 with col_btn:
-    go = st.button(\"Run scrape\", type=\"primary\")
+    go = st.button("Run scrape", type="primary")
 
 with col_info:
-    st.write(\"Output columns: **title**, **tagline**, **list_price**, **payments_from** (just $ amount), **payments_disclaimer**, **image_url**\")
+    st.write("Output columns: **title**, **tagline**, **list_price**, **payments_from** (just $ amount), **payments_disclaimer**, **image_url**")
 
 if go:
     try:
-        with st.spinner(\"Scraping...\"):
+        with st.spinner("Scraping..."):
             df = run_scrape(listing_url.strip())
-        st.success(f\"Done! {len(df)} rows.\")
+        st.success(f"Done! {len(df)} rows.")
 
         st.dataframe(df, use_container_width=True)
 
-        csv_bytes = df.to_csv(index=False).encode(\"utf-8\")
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            \"Download CSV\",
+            "Download CSV",
             data=csv_bytes,
-            file_name=\"parrisrv_listings.csv\",
-            mime=\"text/csv\",
+            file_name="parrisrv_listings.csv",
+            mime="text/csv",
         )
     except Exception as e:
-        st.error(\"Something went wrong:\")
+        st.error("Something went wrong:")
         st.exception(e)
