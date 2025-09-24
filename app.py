@@ -107,7 +107,7 @@ SESSION.headers.update({
 # --------------------------
 def clean_text(t):
     try:
-        return re.sub(r"\\s+", " ", t or "").strip()
+        return re.sub(r"\s+", " ", t or "").strip()
     except Exception:
         return ""
 
@@ -130,7 +130,7 @@ def strip_fragment(u: str) -> str:
 
 def strip_used_prefix(title: str) -> str:
     """Remove leading 'Used', 'USED', 'Used:' or 'Used -' at the very start."""
-    return re.sub(r'^\\s*used\\s*[:\\-]?\\s*', '', title or '', flags=re.I)
+    return re.sub(r'^\s*used\s*[:\-]?\s*', '', title or '', flags=re.I)
 
 
 def is_floorplan_or_virtual_from_strings(*strings) -> bool:
@@ -151,7 +151,7 @@ def pick_from_srcset(srcset: str) -> str:
     items = []
     for part in srcset.split(","):
         part = part.strip()
-        m = re.match(r"(\\S+)\\s+(\\d+)w", part)
+        m = re.match(r"(\S+)\s+(\d+)w", part)
         if m:
             url, w = m.group(1), int(m.group(2))
             items.append((w, url))
@@ -185,10 +185,10 @@ def _closest_amount_after_label(container_text: str, label_regex: re.Pattern, re
         return ""
     start = mlab.end()
     if require_mo:
-        m = re.search(r"\\$\\s*[\\d,]+(?:\\.\\d{2})?\\s*(?=/\\s*mo\\.?)", t[start:], flags=re.I)
+        m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?\s*(?=/\s*mo\.?)", t[start:], flags=re.I)
         return m.group(0).replace(" ", "") if m else ""
     else:
-        m = re.search(r"\\$\\s*[\\d,]+(?:\\.\\d{2})?", t[start:])
+        m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?", t[start:])
         return m.group(0).replace(" ", "") if m else ""
 
 
@@ -217,7 +217,7 @@ def amount_near_label(soup, labels, mo_suffix=False):
             if not box or is_blocklisted(box):
                 continue
 
-            # Robustly build text from the box; sometimes stripped_strings may be None or non-iterable
+            # Robustly build text from the box
             try:
                 if hasattr(box, "stripped_strings"):
                     _iter = getattr(box, "stripped_strings", []) or []
@@ -229,17 +229,18 @@ def amount_near_label(soup, labels, mo_suffix=False):
                     text = ""
             except Exception:
                 text = clean_text(box.get_text(" ", strip=True)) if hasattr(box, "get_text") else ""
+
             amt = _closest_amount_after_label(text, lab_re, require_mo=mo_suffix)
             if amt:
                 return amt
 
             # fallback: pick the largest $ in this box (with /mo when needed)
             candidates = []
-            for m in re.finditer(r"\\$\\s*[\\d,]+(?:\\.\\d{2})?", text):
+            for m in re.finditer(r"\$\s*[\d,]+(?:\.\d{2})?", text):
                 val = m.group(0).replace(" ", "")
                 if mo_suffix:
                     after = text[m.end(): m.end()+20]
-                    if not re.search(r"/\\s*mo\\.?", after, re.I):
+                    if not re.search(r"/\s*mo\.?", after, re.I):
                         continue
                 candidates.append(val)
             if candidates:
@@ -267,7 +268,7 @@ def extract_tagline(soup, name_text: str) -> str:
                 low = safe_lower(txt)
 
                 # Allow "Sleeps X!" as an explicit edge-case, even though "sleeps" is usually blacklisted
-                if re.fullmatch(r"sleeps\\s+\\d+\\s*!", low, flags=re.I):
+                if re.fullmatch(r"sleeps\s+\d+\s*!", low, flags=re.I):
                     return txt
 
                 if any(k in low for k in [
@@ -291,7 +292,7 @@ def extract_tagline(soup, name_text: str) -> str:
             low = safe_lower(txt)
 
             # Allow "Sleeps X!" edge-case
-            if re.fullmatch(r"sleeps\\s+\\d+\\s*!", low, flags=re.I):
+            if re.fullmatch(r"sleeps\s+\d+\s*!", low, flags=re.I):
                 return txt
 
             if any(k in low for k in [
@@ -314,8 +315,8 @@ def extract_tagline(soup, name_text: str) -> str:
             return plain[0]
 
     # fallback: first short non-spec line after the title in global text
-    full_text = (soup.get_text("\\n") or "").replace("\\xa0", " ")
-    lines = [ln.strip() for ln in full_text.split("\\n") if ln.strip()]
+    full_text = (soup.get_text("\n") or "").replace("\xa0", " ")
+    lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
     if name_text and name_text in lines:
         i = lines.index(name_text)
         for j in range(i + 1, min(i + 15, len(lines))):
@@ -323,7 +324,7 @@ def extract_tagline(soup, name_text: str) -> str:
             low = safe_lower(cand)
 
             # Allow "Sleeps X!" edge-case
-            if re.fullmatch(r"sleeps\\s+\\d+\\s*!", low, flags=re.I):
+            if re.fullmatch(r"sleeps\s+\d+\s*!", low, flags=re.I):
                 return cand
 
             if any(k in low for k in [
@@ -347,7 +348,7 @@ IMG_BLACKLIST_KEYWORDS = (
 )
 
 def is_real_image(url: str) -> bool:
-    return bool(re.search(r"\\.(jpe?g|png|webp)(\\?.*)?$", url, re.I))
+    return bool(re.search(r"\.(jpe?g|png|webp)(\?.*)?$", url, re.I))
 
 def is_blacklisted(url_or_alt: str) -> bool:
     u = safe_lower(url_or_alt)
@@ -403,7 +404,7 @@ def extract_main_image(soup: BeautifulSoup, detail_url: str) -> str:
     # 4) background-image / data-* image attributes
     for el in soup.find_all(True):
         style = safe_get_attr(el, "style", "")
-        for m in re.finditer(r"url\\((['\\\"]?)([^)'\"]+)\\1\\)", style or "", re.I):
+        for m in re.finditer(r"url\((['\"]?)([^)'\"]+)\1\)", style or "", re.I):
             url = urljoin(detail_url, m.group(2))
             if is_real_image(url) and not is_blacklisted(url):
                 return url
@@ -433,7 +434,7 @@ def extract_main_image(soup: BeautifulSoup, detail_url: str) -> str:
 
     # 6) inline scripts/JSON
     html_text = str(soup)
-    for m in re.finditer(r"https?://[^\\s\\\"'<>]+?\\.(?:jpe?g|png|webp)(?:\\?[^\\s\\\"'<>]*)?", html_text, re.I):
+    for m in re.finditer(r"https?://[^\s\"'<>]+?\.(?:jpe?g|png|webp)(?:\?[^\s\"'<>]*)?", html_text, re.I):
         url = m.group(0)
         if not is_blacklisted(url) and "logo" not in url.lower() and "floorplan" not in url.lower():
             return url
@@ -442,29 +443,67 @@ def extract_main_image(soup: BeautifulSoup, detail_url: str) -> str:
 
 
 # --------------------------
-# Parse detail page (requests/Playwright HTML)
+# Parse detail page (robust)
 # --------------------------
 def parse_detail_html(detail_url: str, html_text: str):
-    soup = BeautifulSoup(html_text, "html.parser")
+    soup = BeautifulSoup(html_text or "", "html.parser")
 
-    # Title: keep raw for tagline detection; strip "Used" for output
-    h = soup.find(["h1", "h2"])
-    raw_title = clean_text(h.get_text() if h else "")
-    title = strip_used_prefix(raw_title)
+    def norm(s: str) -> str:
+        s = (s or "").replace("\xa0", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
-    # Tagline (use raw on-page heading for best accuracy)
+    # ---- Title (strip leading "Used", case-insensitive, handles unicode spaces)
+    title_el = soup.find(["h1", "h2"]) or soup.select_one(".product-title, .vehicle-title, [itemprop='name']")
+    raw_title = norm(title_el.get_text() if title_el else "")
+    title = re.sub(r'^\s*used\s*[:\-]?\s*', '', raw_title, flags=re.I)
+
+    # ---- Tagline
     tagline = extract_tagline(soup, raw_title)
 
-    # Prices / payments
-    list_price = amount_near_label(soup, [r"\\bList\\s*Price\\b", r"\\bMSRP\\b", r"\\bSale\\s*Price\\b"], mo_suffix=False)
-    payments_from = amount_near_label(soup, [r"\\bPayments?\\s*From\\b", r"\\bFrom:\\b"], mo_suffix=True)
+    # ---- Prices
+    def first_money(s: str) -> str:
+        m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?", s or "")
+        return m.group(0).replace(" ", "") if m else ""
 
-    # Reduce payment to just the $ amount (no "/mo")
-    if payments_from:
-        m = re.search(r"\\$\\s*[\\d,]+(?:\\.\\d{2})?", payments_from)
-        payments_from = m.group(0).replace(" ", "") if m else ""
+    # Try label-local strategy first (original approach, expanded labels)
+    list_price = amount_near_label(
+        soup,
+        [r"\bList\s*Price\b", r"\bMSRP\b", r"\bSale\s*Price\b", r"\bPrice\b", r"Our\s*Price"],
+        mo_suffix=False,
+    )
 
-    # Image
+    # If still empty, try common price containers
+    if not list_price:
+        price_candidates = []
+        for el in soup.select(
+            ".price, .our-price, .sale-price, .msrp, [class*='price'], [id*='price'], [data-price]"
+        ):
+            txt = norm(el.get_text())
+            val = first_money(txt)
+            if val:
+                price_candidates.append(val)
+        if price_candidates:
+            # Pick the largest dollar figure—usually the main price
+            def to_num(x):
+                try: return float(x.replace("$","").replace(",",""))
+                except: return 0.0
+            price_candidates.sort(key=to_num, reverse=True)
+            list_price = price_candidates[0]
+
+    # ---- Payments (any $…/mo anywhere near payment-ish containers)
+    payments_from = amount_near_label(
+        soup, [r"\bPayments?\s*From\b", r"\bFrom:\b", r"As\s+low\s+as"], mo_suffix=True
+    )
+    if not payments_from:
+        for el in soup.select("[class*='payment'], [id*='payment'], .details, .finance, .cta, .summary"):
+            txt = norm(el.get_text())
+            m = re.search(r"(\$\s*[\d,]+(?:\.\d{2})?)\s*/\s*mo\.?", txt, flags=re.I)
+            if m:
+                payments_from = m.group(1).replace(" ", "")
+                break
+
+    # ---- Image
     image_url = extract_main_image(soup, detail_url)
 
     return {
@@ -561,7 +600,7 @@ async def fetch_disclaimers_on_page(context, url: str) -> dict:
                         return href;
                     } catch { return ""; }
                 };
-                const isDetail = (h) => /\\/product\\/used-/i.test(h || "");
+                const isDetail = (h) => /\/product\/used-/i.test(h || "");
                 const anchors = Array.from(document.querySelectorAll("a[href*='/product/used-']"));
                 const allDiscs = Array.from(document.querySelectorAll(".payments-disclaimer-container"));
                 const seen = new Set();
@@ -573,7 +612,7 @@ async def fetch_disclaimers_on_page(context, url: str) -> dict:
                     while (up && steps < 8) {
                         const hit = up.querySelector && up.querySelector(".payments-disclaimer-container");
                         if (hit && hit.textContent) {
-                            const txt = hit.textContent.replace(/\\s+/g, " ").trim();
+                            const txt = hit.textContent.replace(/\s+/g, " ").trim();
                             if (txt) return txt;
                         }
                         up = up.parentElement; steps++;
@@ -584,7 +623,7 @@ async def fetch_disclaimers_on_page(context, url: str) -> dict:
                         if (!d || !d.textContent) continue;
                         let p = d, depth = 0;
                         while (p && depth < 40) { p = p.parentElement; depth++; }
-                        const txt = d.textContent.replace(/\\s+/g, " ").trim();
+                        const txt = d.textContent.replace(/\s+/g, " ").trim();
                         if (txt && depth < bestDist) { best = txt; bestDist = depth; }
                     }
                     return best;
@@ -604,7 +643,7 @@ async def fetch_disclaimers_on_page(context, url: str) -> dict:
         for r in records or []:
             u = strip_fragment(r.get("url", ""))
             if u:
-                disc_map[u] = (r.get("disclaimer") or "").replace("\\u00a0", " ").strip()
+                disc_map[u] = (r.get("disclaimer") or "").replace("\u00a0", " ").strip()
     finally:
         await page.close()
     return disc_map
@@ -693,12 +732,12 @@ async def collect_detail_urls_with_playwright(index_url: str, max_pages: int = 1
 
 
 # --------------------------
-# Fetch detail pages HTML with Playwright (prevents 403)
+# Fetch detail pages HTML with Playwright (prevents 403 & waits for content)
 # --------------------------
 async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = "") -> dict:
     """
     Visit each detail URL with Playwright and return {url -> page_html}.
-    We block images/css/fonts to keep it fast and reuse one tab.
+    We block images/css/fonts to keep it fast. We also wait for late JS content.
     """
     results = {}
     async with async_playwright() as p:
@@ -714,18 +753,48 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
             if rtype in ("image", "media", "font", "stylesheet"):
                 return await route.abort()
             return await route.continue_()
-
         await context.route("**/*", route_handler)
 
         page = await context.new_page()
+
+        async def ensure_loaded():
+            # A sequence of cheap “are we ready yet?” heuristics: titles, prices, main content.
+            sels = [
+                "h1, h2, .product-title",
+                ".price, .our-price, .sale-price, [class*='price']",
+                "[id*='price']",
+                "[class*='payment'], [id*='payment']",
+                ".content, main, [role='main']"
+            ]
+            for sel in sels:
+                try:
+                    await page.wait_for_selector(sel, timeout=2000)
+                except Exception:
+                    pass
+            # small scroll bursts to trigger lazy content
+            try:
+                await page.evaluate("""async () => {
+                    const step = () => new Promise(r => {
+                        window.scrollBy(0, Math.max(400, innerHeight * 0.9));
+                        setTimeout(r, 120);
+                    });
+                    for (let i = 0; i < 6; i++) await step();
+                    window.scrollTo(0, 0);
+                }""")
+            except Exception:
+                pass
+            # one more idle wait
+            try:
+                await page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(150)
+
         try:
             for url in detail_urls:
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    try:
-                        await page.wait_for_selector("h1, h2, .content, .product-title", timeout=4000)
-                    except Exception:
-                        pass
+                    await ensure_loaded()
                     results[url] = await page.content()
                 except Exception:
                     results[url] = ""
@@ -796,7 +865,7 @@ def run_scrape(listing_url: str, max_pages: int = 12) -> pd.DataFrame:
     disc_map = run_coro_resilient(fetch_disclaimers_across_pages(listing_url, max_pages=max_pages))
     st.write(f"Captured **{sum(1 for v in disc_map.values() if v)}** payment disclaimers from listing cards.")
 
-    # 3) Fetch detail pages HTML with Playwright (prevents 403)
+    # 3) Fetch detail pages HTML with Playwright (prevents 403 & waits for content)
     html_map = run_coro_resilient(fetch_detail_pages_html_with_playwright(detail_urls, referer=listing_url))
 
     # 4) Assemble rows
