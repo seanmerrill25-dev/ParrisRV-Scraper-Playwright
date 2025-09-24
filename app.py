@@ -217,7 +217,18 @@ def amount_near_label(soup, labels, mo_suffix=False):
             if not box or is_blocklisted(box):
                 continue
 
-            text = " ".join(box.stripped_strings) if hasattr(box, "stripped_strings") else ""
+            # Robustly build text from the box; sometimes stripped_strings may be None or non-iterable
+            try:
+                if hasattr(box, "stripped_strings"):
+                    _iter = getattr(box, "stripped_strings", []) or []
+                    strings = list(_iter) if hasattr(_iter, "__iter__") else []
+                    if not strings and hasattr(box, "get_text"):
+                        strings = [box.get_text(" ", strip=True)]
+                    text = " ".join(strings)
+                else:
+                    text = ""
+            except Exception:
+                text = clean_text(box.get_text(" ", strip=True)) if hasattr(box, "get_text") else ""
             amt = _closest_amount_after_label(text, lab_re, require_mo=mo_suffix)
             if amt:
                 return amt
