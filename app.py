@@ -81,7 +81,7 @@ def run_coro_resilient(coro):
 
 
 # --------------------------
-# HTTP session (fallback for detail pages if needed)
+# HTTP session (for metadata and parity; we DO NOT fetch details via requests to avoid 403)
 # --------------------------
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -104,14 +104,27 @@ def clean_text(t):
     except Exception:
         return ""
 
+def join_strings(parts) -> str:
+    """Safely join an iterable of strings; tolerate non-iterables gracefully."""
+    if parts is None:
+        return ""
+    out = []
+    try:
+        for p in parts:
+            if isinstance(p, str):
+                out.append(p)
+    except TypeError:
+        # Not iterable; coerce to string
+        if isinstance(parts, str):
+            return parts
+        return ""
+    return " ".join(out)
 
 def safe_get_attr(tag, attr, default=""):
     return tag.get(attr) if hasattr(tag, "get") else default
 
-
 def safe_lower(s):
     return s.lower() if isinstance(s, str) else ""
-
 
 def strip_fragment(u: str) -> str:
     """Remove #fragment and trailing punctuation; normalize trailing slash."""
@@ -120,11 +133,9 @@ def strip_fragment(u: str) -> str:
     u = html.unescape(u or "").split("#", 1)[0].rstrip(").,;")
     return u[:-1] if u.endswith("/") else u
 
-
 def strip_used_prefix(title: str) -> str:
     """Remove leading 'Used', 'USED', 'Used:' or 'Used -' at the very start."""
     return re.sub(r'^\s*used\s*[:\-]?\s*', '', title or '', flags=re.I)
-
 
 def is_floorplan_or_virtual_from_strings(*strings) -> bool:
     parts = []
@@ -135,7 +146,6 @@ def is_floorplan_or_virtual_from_strings(*strings) -> bool:
             parts.append(safe_lower(s))
     blob = " ".join(parts)
     return any(k in blob for k in ["floorplan", "floor plan", "virtual", "tour", "360"])
-
 
 def pick_from_srcset(srcset: str) -> str:
     """Choose the largest width entry from a srcset."""
@@ -156,7 +166,6 @@ def pick_from_srcset(srcset: str) -> str:
         return ""
     items.sort(key=lambda x: x[0], reverse=True)
     return items[0][1]
-
 
 def pick_img_url(img_tag) -> str:
     if not hasattr(img_tag, "get"):
@@ -183,7 +192,6 @@ def _closest_amount_after_label(container_text: str, label_regex: re.Pattern, re
     else:
         m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?", t[start:])
         return m.group(0).replace(" ", "") if m else ""
-
 
 def amount_near_label(soup, labels, mo_suffix=False):
     BLOCKLIST = ("disclaimer", "fine", "footnote", "legal", "terms", "finance")
@@ -213,15 +221,16 @@ def amount_near_label(soup, labels, mo_suffix=False):
             # Robustly build text from the box
             try:
                 if hasattr(box, "stripped_strings"):
-                    _iter = getattr(box, "stripped_strings", []) or []
-                    strings = list(_iter) if hasattr(_iter, "__iter__") else []
-                    if not strings and hasattr(box, "get_text"):
-                        strings = [box.get_text(" ", strip=True)]
-                    text = " ".join(strings)
+                    strings = list(getattr(box, "stripped_strings") or [])
+                    text = join_strings(strings)
+                    if not text and hasattr(box, "get_text"):
+                        text = box.get_text(" ", strip=True) or ""
+                elif hasattr(box, "get_text"):
+                    text = box.get_text(" ", strip=True) or ""
                 else:
                     text = ""
             except Exception:
-                text = clean_text(box.get_text(" ", strip=True)) if hasattr(box, "get_text") else ""
+                text = box.get_text(" ", strip=True) if hasattr(box, "get_text") else ""
 
             amt = _closest_amount_after_label(text, lab_re, require_mo=mo_suffix)
             if amt:
@@ -511,15 +520,48 @@ def parse_detail_html(detail_url: str, html_text: str):
 # --------------------------
 # Playwright: listing-page auto-scroll + disclaimers
 # --------------------------
-async def autoscroll_until_stable(page, min_cycles=3, max_loops=60):
+async def autoscroll_until_stable(page, min_cycles=3, max_loops=80):
     async def count_links():
-        # Count both product anchors and "View Details" CTAs
+        # Count both product anchors and "View Details" CTAs and clickable cards
         return await page.evaluate("""
             () => {
-                const a1 = Array.from(document.querySelectorAll("a[href*='/product/']"));
-                const a2 = Array.from(document.querySelectorAll("a,button")).filter(el => /view\s+details/i.test(el.textContent || ""));
-                const hrefs = new Set(a1.map(a => a.href).concat(a2.map(el => el.href).filter(Boolean)));
-                return hrefs.size;
+                const urls = new Set();
+
+                // 1) Direct anchors
+                document.querySelectorAll("a[href*='/product/']").forEach(a => {
+                    if (a.href) urls.add(a.href);
+                });
+
+                // 2) "View Details" CTAs
+                Array.from(document.querySelectorAll("a,button")).forEach(el => {
+                    const txt = (el.textContent || "").toLowerCase();
+                    if (/view\\s+details/.test(txt)) {
+                        if (el.href) urls.add(el.href);
+                        const dh = el.getAttribute("data-href");
+                        if (dh) {
+                            try { urls.add(new URL(dh, location.href).href); } catch {}
+                        }
+                        const oc = el.getAttribute("onclick") || "";
+                        const m = oc.match(/['\\"]([^'\\"]*\\/product\\/[^'\\"]+)['\\"]/);
+                        if (m) { try { urls.add(new URL(m[1], location.href).href); } catch {} }
+                    }
+                });
+
+                // 3) Cards with data-href
+                Array.from(document.querySelectorAll("[data-href*='/product/']")).forEach(el => {
+                    const dh = el.getAttribute("data-href");
+                    if (dh) { try { urls.add(new URL(dh, location.href).href); } catch {} }
+                });
+
+                // 4) Inline JSON blobs that contain /product/ URLs
+                const html = document.documentElement.innerHTML;
+                const rx = /https?:\\/\\/[^"'<\\s]+\\/product\\/[^"'<\\s]+/g;
+                let m;
+                while ((m = rx.exec(html)) !== null) {
+                    urls.add(m[0]);
+                }
+
+                return urls.size;
             }
         """)
     async def click_load_more_if_any():
@@ -531,6 +573,8 @@ async def autoscroll_until_stable(page, min_cycles=3, max_loops=60):
             "[data-action='load-more']",
             ".load-more",
             ".show-more",
+            "button[aria-label='Load more']",
+            "button[aria-label='Show more']",
         ]
         for sel in selectors:
             loc = page.locator(sel)
@@ -547,7 +591,7 @@ async def autoscroll_until_stable(page, min_cycles=3, max_loops=60):
         return False
 
     # Try to ensure the grid exists
-    for sel in ["[class*='listing']", ".inventory", ".inventory-grid", ".results", "main"]:
+    for sel in ["[class*='listing']", ".inventory", ".inventory-grid", ".results", "main", "#content"]:
         try:
             await page.wait_for_selector(sel, timeout=2000)
             break
@@ -560,14 +604,14 @@ async def autoscroll_until_stable(page, min_cycles=3, max_loops=60):
         await page.evaluate(
             """async () => {
                 const step = () => new Promise(r => {
-                    window.scrollBy(0, Math.max(600, innerHeight * 0.95));
-                    setTimeout(r, 140);
+                    window.scrollBy(0, Math.max(800, innerHeight * 0.95));
+                    setTimeout(r, 120);
                 });
-                for (let i = 0; i < 10; i++) await step();
+                for (let i = 0; i < 14; i++) await step();
             }"""
         )
         try:
-            await page.wait_for_load_state("networkidle", timeout=2500)
+            await page.wait_for_load_state("networkidle", timeout=3000)
         except PWTimeout:
             pass
 
@@ -607,42 +651,54 @@ async def fetch_disclaimers_on_page(context, url: str) -> dict:
                         return href;
                     } catch { return ""; }
                 };
-                const isDetail = (h) => /\/product\/used-/i.test(h || "");
-                const anchors = Array.from(document.querySelectorAll("a[href*='/product/used-']"));
-                const allDiscs = Array.from(document.querySelectorAll(".payments-disclaimer-container"));
-                const seen = new Set();
-                const out = [];
+                const isDetail = (h) => /\\/product\\/used-/i.test(h || "");
+                // Collect candidate card nodes (anchor, button, card containers)
+                const cards = Array.from(document.querySelectorAll(
+                    ".inventory, .listing, .results, [data-href*='/product/'], a[href*='/product/used-']"
+                ));
 
-                const disclaimerForAnchor = (a) => {
-                    // up to 8 ancestors search
-                    let up = a, steps = 0;
+                const getDisclaimerNear = (node) => {
+                    // search upward then nearby
+                    let up = node, steps = 0;
                     while (up && steps < 8) {
-                        const hit = up.querySelector && up.querySelector(".payments-disclaimer-container");
+                        const hit = up.querySelector && up.querySelector(".payments-disclaimer-container, .payment-disclaimer, [class*='disclaimer']");
                         if (hit && hit.textContent) {
-                            const txt = hit.textContent.replace(/\s+/g, " ").trim();
+                            const txt = hit.textContent.replace(/\\s+/g, " ").trim();
                             if (txt) return txt;
                         }
                         up = up.parentElement; steps++;
                     }
-                    // fallback: nearest-ish by DOM depth
-                    let best = "", bestDist = 1e9;
-                    for (const d of allDiscs) {
-                        if (!d || !d.textContent) continue;
-                        let p = d, depth = 0;
-                        while (p && depth < 40) { p = p.parentElement; depth++; }
-                        const txt = d.textContent.replace(/\s+/g, " ").trim();
-                        if (txt && depth < bestDist) { best = txt; bestDist = depth; }
-                    }
-                    return best;
+                    return "";
                 };
 
-                for (const a of anchors) {
-                    const url = norm(a.href);
-                    if (!url || !isDetail(url) || seen.has(url)) continue;
+                const out = [];
+                const seen = new Set();
+                const collectUrl = (el) => {
+                    if (!el) return;
+                    let url = "";
+                    if (el.href) url = el.href;
+                    if (!url) {
+                        const dh = el.getAttribute && el.getAttribute("data-href");
+                        if (dh) { try { url = new URL(dh, location.href).href; } catch {} }
+                    }
+                    if (!url) {
+                        const oc = el.getAttribute && el.getAttribute("onclick") || "";
+                        const m = oc && oc.match(/['\\"]([^'\\"]*\\/product\\/[^'\\"]+)['\\"]/);
+                        if (m) { try { url = new URL(m[1], location.href).href; } catch {} }
+                    }
+                    if (!url) return;
+                    url = norm(url);
+                    if (!url || !isDetail(url) || seen.has(url)) return;
                     seen.add(url);
-                    const disclaimer = disclaimerForAnchor(a);
+                    const disclaimer = getDisclaimerNear(el);
                     out.push({ url, disclaimer });
-                }
+                };
+
+                // from anchors
+                document.querySelectorAll("a[href*='/product/used-']").forEach(collectUrl);
+                // from buttons/containers
+                document.querySelectorAll("a,button,[data-href]").forEach(collectUrl);
+
                 return out;
             }"""
         )
@@ -670,9 +726,10 @@ async def fetch_disclaimers_across_pages(listing_url: str, max_pages: int = 12) 
         )
         try:
             for page in range(1, max_pages + 1):
-                url = listing_url if page == 1 else (
-                    f"{listing_url}&page={page}" if "page=" not in listing_url else listing_url.replace(re.search(r'(?:[?&])page=\d+', listing_url).group(0), f'?page={page}') if re.search(r'(?:[?&])page=\d+', listing_url) else listing_url
-                )
+                if "page=" in listing_url:
+                    url = re.sub(r"([?&])page=\d+", rf"\\1page={page}", listing_url)
+                else:
+                    url = listing_url if page == 1 else f"{listing_url}&page={page}"
                 disc = await fetch_disclaimers_on_page(context, url)
                 out.update(disc)
                 if page > 1 and not disc:
@@ -712,7 +769,7 @@ async def collect_detail_urls_with_playwright(index_url: str, max_pages: int = 1
             for page_num in range(1, max_pages + 1):
                 if "page=" in index_url:
                     # Replace existing page param with current
-                    url = re.sub(r"([?&])page=\d+", rf"\g<1>page={page_num}", index_url)
+                    url = re.sub(r"([?&])page=\d+", rf"\\1page={page_num}", index_url)
                 else:
                     url = index_url if page_num == 1 else f"{index_url}&page={page_num}"
 
@@ -720,17 +777,44 @@ async def collect_detail_urls_with_playwright(index_url: str, max_pages: int = 1
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     await autoscroll_until_stable(page)
-                    # collect product anchors and explicit "View Details" CTAs
-                    urls = await page.eval_on_selector_all(
-                        "a[href*='/product/']",
-                        "els => els.map(a => a.href)"
-                    )
-                    ctas = await page.eval_on_selector_all(
-                        "a:has-text('View Details'), button:has-text('View Details')",
-                        "els => els.map(el => el.href).filter(Boolean)"
-                    )
-                    urls = (urls or []) + (ctas or [])
-                    urls = _filter_detail_urls(urls)
+
+                    # Collect from multiple sources
+                    urls = await page.evaluate("""
+                        () => {
+                            const out = new Set();
+
+                            // 1) Anchors
+                            document.querySelectorAll("a[href*='/product/']").forEach(a => {
+                                if (a.href) out.add(a.href);
+                            });
+
+                            // 2) View Details CTAs + onclick + data-href
+                            Array.from(document.querySelectorAll("a,button,[data-href]")).forEach(el => {
+                                const txt = (el.textContent || "").toLowerCase();
+                                const dh = el.getAttribute && el.getAttribute("data-href");
+                                const oc = el.getAttribute && el.getAttribute("onclick") || "";
+                                if (/view\\s+details/.test(txt) || (dh && /\\/product\\//.test(dh)) or (/\\/product\\//.test(oc or ""))) {
+                                    if (el.href) out.add(el.href);
+                                    if (dh) {
+                                        try { out.add(new URL(dh, location.href).href); } catch {}
+                                    }
+                                    const m = oc && oc.match(/['\\"]([^'\\"]*\\/product\\/[^'\\"]+)['\\"]/);
+                                    if (m) { try { out.add(new URL(m[1], location.href).href); } catch {} }
+                                }
+                            });
+
+                            // 3) Inline HTML/JSON search
+                            const html = document.documentElement.innerHTML;
+                            const rx = /https?:\\/\\/[^"'<\\s]+\\/product\\/[^"'<\\s]+/g;
+                            let m;
+                            while ((m = rx.exec(html)) !== null) {
+                                out.add(m[0]);
+                            }
+
+                            return Array.from(out);
+                        }
+                    """)
+                    urls = _filter_detail_urls(urls or [])
                     before = len(all_urls)
                     all_urls |= urls
                     if page_num > 1 and len(all_urls) == before:
@@ -765,15 +849,14 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
 
         async def ensure_loaded():
             sels = [
-                "h1, h2, .product-title",
-                ".price, .our-price, .sale-price, [class*='price']",
-                "[id*='price']",
+                "h1, h2, .product-title, [itemprop='name']",
+                ".price, .our-price, .sale-price, [class*='price'], [id*='price']",
                 "[class*='payment'], [id*='payment']",
                 ".content, main, [role='main']"
             ]
             for sel in sels:
                 try:
-                    await page.wait_for_selector(sel, timeout=2000)
+                    await page.wait_for_selector(sel, timeout=2500)
                 except Exception:
                     pass
             try:
@@ -782,13 +865,13 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
                         window.scrollBy(0, Math.max(400, innerHeight * 0.9));
                         setTimeout(r, 120);
                     });
-                    for (let i = 0; i < 6; i++) await step();
+                    for (let i = 0; i < 8; i++) await step();
                     window.scrollTo(0, 0);
                 }""")
             except Exception:
                 pass
             try:
-                await page.wait_for_load_state("networkidle", timeout=3000)
+                await page.wait_for_load_state("networkidle", timeout=3500)
             except Exception:
                 pass
             await page.wait_for_timeout(150)
@@ -810,35 +893,21 @@ async def fetch_detail_pages_html_with_playwright(detail_urls, referer: str = ""
 
 
 # --------------------------
-# Network fetch + row assembly
+# Row assembly
 # --------------------------
-def fetch_detail_html(url, retries=2, timeout=25):
-    for attempt in range(retries + 1):
-        try:
-            resp = SESSION.get(url, timeout=timeout)
-            resp.raise_for_status()
-            return resp.text
-        except Exception:
-            if attempt == retries:
-                raise
-            time.sleep(0.5 * (attempt + 1))
-
 def process_one(u, html_text, disc_map):
     try:
         if html_text:
             row = parse_detail_html(u, html_text)
         else:
-            try:
-                html_text = fetch_detail_html(u)
-                row = parse_detail_html(u, html_text)
-            except Exception:
-                row = {
-                    "title": strip_used_prefix(u.split("/")[-1].replace("-", " ")),
-                    "tagline": "",
-                    "list_price": "",
-                    "payments_from": "",
-                    "image_url": "",
-                }
+            # If we couldn't get content via Playwright, return a partial row
+            row = {
+                "title": strip_used_prefix(u.split("/")[-1].replace("-", " ")),
+                "tagline": "",
+                "list_price": "",
+                "payments_from": "",
+                "image_url": "",
+            }
 
         row["title"] = strip_used_prefix(row.get("title", ""))
         row["payments_disclaimer"] = disc_map.get(strip_fragment(u), "")
