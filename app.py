@@ -1,21 +1,22 @@
 # app.py
-# Streamlit UI for ParrisRV list-page scraper (Playwright-only, Streamlit Cloud friendly)
-# New strategy: scrape EVERYTHING directly from the LISTING GRID (no detail-page fetches)
-# Outputs: title, tagline(=blank here), list_price, payments_from, payments_disclaimer, image_url, detail_url
+# ParrisRV listing-grid scraper (no detail-page visits; avoids bot challenge)
+# Grabs: title, list_price, payments_from, payments_disclaimer, image_url, detail_url
+# Hardened: robust autoscroll, real pagination clicking, &page=N fallback, retries, dedupe
 
 import sys
 import re
 import html
 import asyncio
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urljoin
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup, NavigableString
 import streamlit as st
+from bs4 import BeautifulSoup
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 import subprocess
+import random
 
 # ---------- Ensure Playwright Chromium ----------
 def _ensure_playwright_browser():
@@ -59,7 +60,7 @@ def run_coro_resilient(coro):
             return asyncio.run(coro)
         raise
 
-# ---------- HTTP session (headers only) ----------
+# ---------- HTTP headers (not used for fetching, but for UA consistency) ----------
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -87,48 +88,9 @@ def strip_fragment(u: str) -> str:
 def strip_used_prefix(title: str) -> str:
     return re.sub(r'^\s*used\s*[:\-]?\s*', '', title or '', flags=re.I)
 
-def is_money(s: str) -> bool:
-    return bool(re.search(r"\$\s*[\d,]+(?:\.\d{2})?", s or ""))
-
-def extract_first_money(s: str) -> str:
-    m = re.search(r"\$\s*[\d,]+(?:\.\d{2})?", s or "")
-    return m.group(0).replace(" ", "") if m else ""
-
-def extract_per_month(s: str) -> str:
-    m = re.search(r"(\$\s*[\d,]+(?:\.\d{2})?)\s*/\s*mo\.?", s or "", re.I)
-    return (m.group(1) or "").replace(" ", "") if m else ""
-
-def best_img_from(el) -> str:
-    # Try common attributes first
-    for sel in ["img", "picture source", "[data-src]", "[data-image]", "[data-bg]"]:
-        try:
-            node = el.query_selector(sel)
-            if node:
-                for attr in ("src", "data-src", "data-image", "data-bg", "srcset"):
-                    v = (node.get_attribute(attr) or "").strip()
-                    if v:
-                        # srcset -> pick the last (usually largest)
-                        if attr == "srcset":
-                            last = v.split(",")[-1].strip().split(" ")[0]
-                            if last:
-                                return last
-                        return v
-        except Exception:
-            pass
-    # fallback: search style background-image
-    try:
-        style = el.get_attribute("style") or ""
-        m = re.search(r"url\((['\"]?)([^)'\"]+)\1\)", style, re.I)
-        if m:
-            return m.group(2)
-    except Exception:
-        pass
-    return ""
-
-# ---------- Playwright: listing-page auto-scroll ----------
-async def autoscroll_until_stable(page, min_cycles=5, max_loops=200):
+# ---------- Autoscroll ----------
+async def autoscroll_until_stable(page, min_cycles=6, max_loops=240):
     async def count_cards():
-        # Count likely unit cards (anchors with /product/used-)
         return await page.evaluate("""
             () => {
                 const hrefs = new Set();
@@ -155,9 +117,10 @@ async def autoscroll_until_stable(page, min_cycles=5, max_loops=200):
                 pass
         return False
 
+    # Wait for grid-ish container
     for sel in ["[class*='listing']", ".inventory", ".inventory-grid", ".results", "main", "#content"]:
         try:
-            await page.wait_for_selector(sel, timeout=2500)
+            await page.wait_for_selector(sel, timeout=4000)
             break
         except Exception:
             pass
@@ -165,14 +128,14 @@ async def autoscroll_until_stable(page, min_cycles=5, max_loops=200):
     stable, last = 0, -1
     for _ in range(max_loops):
         await page.evaluate("""async () => {
-            const step = () => new Promise(r => { window.scrollBy(0, Math.max(900, innerHeight*0.98)); setTimeout(r, 120); });
-            for (let i=0;i<18;i++) await step();
+            const step = () => new Promise(r => { window.scrollBy(0, Math.max(1200, innerHeight*0.98)); setTimeout(r, 110); });
+            for (let i=0;i<20;i++) await step();
         }""")
-        try: await page.wait_for_load_state("networkidle", timeout=4000)
+        try: await page.wait_for_load_state("networkidle", timeout=4500)
         except PWTimeout: pass
 
         if await click_load_more_if_any():
-            try: await page.wait_for_load_state("networkidle", timeout=5000)
+            try: await page.wait_for_load_state("networkidle", timeout=6000)
             except PWTimeout: pass
 
         curr = await count_cards()
@@ -181,12 +144,8 @@ async def autoscroll_until_stable(page, min_cycles=5, max_loops=200):
         if stable >= min_cycles:
             break
 
-# ---------- Extract cards on a single listing page (pure client-side) ----------
+# ---------- Extract cards on listing page ----------
 async def extract_cards_on_listing_page(page, base_url: str):
-    """
-    Returns a list of dicts with fields:
-    title, list_price, payments_from, payments_disclaimer, image_url, detail_url
-    """
     records = await page.evaluate(
         """(base) => {
             const norm = (s) => (s || "").replace(/\\s+/g, " ").trim();
@@ -205,33 +164,33 @@ async def extract_cards_on_listing_page(page, base_url: str):
             const seen = new Set();
             const out = [];
 
-            // A "card" is approximated by the nearest ancestor that contains a /product/used- link.
             const anchors = Array.from(document.querySelectorAll("a[href*='/product/used-']"));
             for (const a of anchors) {
+                // find a reasonable card ancestor
                 let card = a;
-                for (let i=0;i<6 && card;i++){
-                    if (card.querySelector && card.querySelector("a[href*='/product/used-']") && card.querySelector("[class*='price'], [id*='price'], .price, .sale-price, .our-price, [class*='payment'], .payment")) {
-                        break;
-                    }
+                for (let i=0; i<6 && card; i++) {
+                    const hasPriceish = card.querySelector && card.querySelector(".price, .sale-price, .our-price, [class*='price'], [id*='price']");
+                    const hasPayish   = card.querySelector && card.querySelector("[class*='payment'], [id*='payment'], .finance, .cta, .summary");
+                    if (hasPriceish || hasPayish) break;
                     card = card.parentElement;
                 }
                 card = card || a.closest("article, .card, .inventory-item, .result, li, div");
+
                 const detail_url = abs(a.href || "");
                 if (!detail_url || seen.has(detail_url)) continue;
                 seen.add(detail_url);
 
-                // text buckets
+                // collect text
                 const text = norm(card ? card.textContent || "" : a.textContent || "");
 
-                // title: prefer heading inside the card, else anchor text
+                // title
                 let title = "";
                 const h = card && (card.querySelector("h1,h2,h3,.title,[itemprop='name'],.product-title,.vehicle-title"));
                 if (h) title = norm(h.textContent);
                 if (!title) title = norm(a.textContent || "");
-                // strip leading "Used"
                 title = title.replace(/^\\s*used\\s*[:\\-]?\\s*/i, "");
 
-                // price candidates
+                // price
                 let list_price = "";
                 const priceEl = card && card.querySelector(".price, .sale-price, .our-price, [class*='price'], [id*='price'], [data-price]");
                 if (priceEl) list_price = pickMoney(priceEl.textContent);
@@ -264,7 +223,6 @@ async def extract_cards_on_listing_page(page, base_url: str):
                     }
                 }
                 if (!image_url) {
-                    // try any style background on the card
                     const style = (card && card.getAttribute("style")) || "";
                     const m = style.match(/url\\((['\\"]?)([^)'"]+)\\1\\)/i);
                     if (m) image_url = m[2];
@@ -280,7 +238,8 @@ async def extract_cards_on_listing_page(page, base_url: str):
         }""",
         base_url
     )
-    # dedupe and clean
+
+    # Clean & dedupe
     cleaned = []
     seen = set()
     for r in records:
@@ -289,83 +248,225 @@ async def extract_cards_on_listing_page(page, base_url: str):
             continue
         seen.add(u)
         r["title"] = strip_used_prefix(r.get("title",""))
+        # drop bot challenge/placeholder-looking titles
+        t = (r["title"] or "").lower()
+        if not t or "verify you are human" in t or t in {"used", '""",""used"'}:
+            continue
         cleaned.append(r)
     return cleaned
 
-# ---------- Iterate across listing pages ----------
-async def collect_all_cards_across_pages(listing_url: str, max_pages: int = 12):
-    results = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=SESSION.headers["User-Agent"])
-        try:
-            for page_num in range(1, max_pages + 1):
-                if "page=" in listing_url:
-                    url = re.sub(r"([?&])page=\d+", rf"\\1page={page_num}", listing_url)
-                else:
-                    url = listing_url if page_num == 1 else f"{listing_url}&page={page_num}"
+# ---------- Pagination handlers ----------
+async def discover_and_click_through_pagination(page, base_url: str, max_clicks: int = 50):
+    """Use on-page pagination controls (Next/numbered pages)."""
+    all_cards = []
+    seen_pages = set()
 
-                page = await context.new_page()
+    async def page_key():
+        # a rough key based on current URL and a page marker in DOM if present
+        try:
+            href = await page.evaluate("() => location.href")
+        except Exception:
+            href = base_url
+        try:
+            marker = await page.evaluate("""() => {
+                const p = document.querySelector(".pagination .active, .pager .active, .page-item.active");
+                return p ? (p.textContent || "").trim() : "";
+            }""")
+        except Exception:
+            marker = ""
+        return f"{href}::{marker}"
+
+    clicks = 0
+    while clicks < max_clicks:
+        await autoscroll_until_stable(page)
+        key = await page_key()
+        if key in seen_pages:
+            break
+        seen_pages.add(key)
+
+        cards = await extract_cards_on_listing_page(page, base_url)
+        all_cards.extend(cards)
+
+        # Try to click "Next"
+        next_clicked = False
+        for sel in ["a[rel='next']", "button[rel='next']",
+                    ".pagination a:has-text('Next')",
+                    ".pager a:has-text('Next')",
+                    "a.page-link:has-text('Next')"]:
+            loc = page.locator(sel)
+            try:
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click(timeout=2500)
+                    try: await page.wait_for_load_state("networkidle", timeout=6000)
+                    except PWTimeout: pass
+                    next_clicked = True
+                    break
+            except Exception:
+                pass
+
+        # If no explicit Next, try numbered pages: current active -> next sibling
+        if not next_clicked:
+            try:
+                has_num_paging = await page.evaluate("""() => !!document.querySelector(".pagination, .pager")""")
+            except Exception:
+                has_num_paging = False
+
+            if has_num_paging:
+                try:
+                    # Try to click the first enabled page number greater than the active one
+                    clicked = await page.evaluate("""() => {
+                        const pagers = document.querySelectorAll(".pagination, .pager");
+                        const tryClick = (el) => {
+                            if (!el || el.classList.contains("disabled")) return false;
+                            const a = el.querySelector("a,button");
+                            if (a) { a.click(); return true; }
+                            return false;
+                        };
+                        for (const p of pagers) {
+                            const active = p.querySelector(".active");
+                            if (active) {
+                                let n = active.nextElementSibling;
+                                while (n) {
+                                    if (tryClick(n)) return true;
+                                    n = n.nextElementSibling;
+                                }
+                            }
+                            // fallback: last link with higher number than smallest
+                            const nums = [...p.querySelectorAll("a,button")].map(x => (x.textContent||"").trim()).filter(x => /^\\d+$/.test(x));
+                            if (nums.length) {
+                                const maxNum = Math.max(...nums.map(x => parseInt(x,10)));
+                                const current = parseInt((p.querySelector(".active")?.textContent||"").trim(), 10) || 1;
+                                if (maxNum > current) {
+                                    const cand = [...p.querySelectorAll("a,button")].find(x => (x.textContent||"").trim() == String(current+1));
+                                    if (cand) { cand.click(); return true; }
+                                }
+                            }
+                        }
+                        return false;
+                    }""")
+                    if clicked:
+                        try: await page.wait_for_load_state("networkidle", timeout=6000)
+                        except PWTimeout: pass
+                        next_clicked = True
+                except Exception:
+                    pass
+
+        if not next_clicked:
+            break  # no more pages
+        clicks += 1
+
+    # de-duplicate by URL
+    uniq = {}
+    for r in all_cards:
+        uniq[strip_fragment(r["detail_url"])] = r
+    return list(uniq.values())
+
+async def iterate_pages_with_query_param(context, listing_url: str, max_pages: int = 40):
+    """Fallback paginator: appends/updates &page=N."""
+    all_cards = []
+    empty_in_a_row = 0
+    for page_num in range(1, max_pages + 1):
+        if "page=" in listing_url:
+            url = re.sub(r"([?&])page=\d+", rf"\1page={page_num}", listing_url)
+        else:
+            url = listing_url if page_num == 1 else f"{listing_url}&page={page_num}"
+
+        page = await context.new_page()
+        try:
+            # a couple of retries per page
+            cards = []
+            for attempt in range(1, 4):
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     await autoscroll_until_stable(page)
                     cards = await extract_cards_on_listing_page(page, url)
-                    results.extend(cards)
-                    # if a later page yields nothing, we assume we're done
-                    if page_num > 1 and not cards:
+                    if cards:
                         break
-                finally:
-                    await page.close()
-        finally:
-            await browser.close()
+                    # gentle backoff if empty
+                    await page.wait_for_timeout(400 + attempt * 300)
+                except Exception:
+                    if attempt == 3:
+                        cards = []
+                    else:
+                        await page.wait_for_timeout(400 + attempt * 300)
+                        continue
 
-    # Final dedupe by detail_url
+            if cards:
+                all_cards.extend(cards)
+                empty_in_a_row = 0
+            else:
+                empty_in_a_row += 1
+                if page_num > 1 and empty_in_a_row >= 2:
+                    break
+        finally:
+            await page.close()
+
     uniq = {}
-    for r in results:
+    for r in all_cards:
         uniq[strip_fragment(r["detail_url"])] = r
     return list(uniq.values())
 
-# ---------- Streamlit scrape runner ----------
-def run_scrape_from_listing(listing_url: str, max_pages: int = 12) -> pd.DataFrame:
+# ---------- Orchestrator ----------
+async def collect_all_cards_across_pages(listing_url: str, max_pages: int = 40):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=SESSION.headers["User-Agent"])
+        try:
+            # First try: click through real pagination controls
+            page = await context.new_page()
+            try:
+                await page.goto(listing_url, wait_until="domcontentloaded", timeout=60000)
+                cards_via_clicks = await discover_and_click_through_pagination(page, listing_url)
+            finally:
+                await page.close()
+
+            # If that produced a healthy count (e.g., > 30), use it; else, do the &page=N fallback too
+            if len(cards_via_clicks) >= 30:
+                base_set = {strip_fragment(r["detail_url"]): r for r in cards_via_clicks}
+            else:
+                base_set = {}
+
+            cards_via_pages = await iterate_pages_with_query_param(context, listing_url, max_pages=max_pages)
+            for r in cards_via_pages:
+                base_set[strip_fragment(r["detail_url"])] = r
+
+            return list(base_set.values())
+        finally:
+            await browser.close()
+
+# ---------- Streamlit runner ----------
+def run_scrape_from_listing(listing_url: str, max_pages: int = 40) -> pd.DataFrame:
     cards = run_coro_resilient(collect_all_cards_across_pages(listing_url, max_pages=max_pages))
 
-    # Basic validation: drop rows that are clearly challenges/placeholders
-    def bad_row(r):
-        t = (r.get("title") or "").lower()
-        return (not t) or ("verify you are human" in t) or (t in {"used", '""",""used"'})
-    kept = [r for r in cards if not bad_row(r)]
-    dropped = [r for r in cards if bad_row(r)]
+    st.write(f"Collected **{len(cards)}** unique cards across pages.")
 
-    st.write(f"Found **{len(cards)}** cards across pages.")
-    if dropped:
-        st.warning(f"Dropped {len(dropped)} obvious non-units (bot challenges/placeholders).")
-
+    # Final cleanup
     cols = ["title","tagline","list_price","payments_from","payments_disclaimer","image_url","detail_url"]
-    for r in kept:
+    for r in cards:
         for k in cols:
             r.setdefault(k, "")
-    df = pd.DataFrame([{k: r.get(k,"") for k in cols} for r in kept])
+    df = pd.DataFrame([{k: r.get(k,"") for k in cols} for r in cards])
     return df
 
 # ---------- Streamlit UI ----------
-st.set_page_config(page_title="ParrisRV Scraper (Listing-Only)", page_icon="🧹", layout="wide")
-st.title("ParrisRV Listing Scraper (Listing-Only Mode)")
-st.caption("Scrapes directly from the listing grid (no detail-page visits) to avoid bot challenges.")
+st.set_page_config(page_title="ParrisRV Listing Scraper (Listing-Only, Full Coverage)", page_icon="🧹", layout="wide")
+st.title("ParrisRV Listing Scraper — Full Coverage")
+st.caption("Scrapes all listing pages (clicks Next and tries &page=N fallback) to capture every unit without visiting detail pages.")
 
 default_url = "https://www.parrisrv.com/used-rvs-for-sale?s=true&lots=1232&pagesize=72&sort=year-asc"
-listing_url = st.text_input("Listing URL", value=default_url, help="Example: a 'used-rvs-for-sale' page with pagesize & sort")
+listing_url = st.text_input("Listing URL", value=default_url, help="Example: 'used-rvs-for-sale' with pagesize & sort")
 
 col_btn, col_info = st.columns([1, 3])
 with col_btn:
     go = st.button("Run scrape", type="primary")
 
 with col_info:
-    st.write("Output columns: **title**, **tagline** (blank), **list_price**, **payments_from** (e.g. $205), **payments_disclaimer**, **image_url**, **detail_url**")
+    st.write("Output: **title**, **list_price**, **payments_from**, **payments_disclaimer**, **image_url**, **detail_url**")
 
 if go:
     try:
         with st.spinner("Scraping listing pages..."):
-            df = run_scrape_from_listing(listing_url.strip(), max_pages=20)  # allow more pages just in case
+            df = run_scrape_from_listing(listing_url.strip(), max_pages=40)
         st.success(f"Done! {len(df)} rows.")
         st.dataframe(df, use_container_width=True)
 
