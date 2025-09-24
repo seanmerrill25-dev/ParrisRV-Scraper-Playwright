@@ -793,7 +793,7 @@ async def collect_detail_urls_with_playwright(index_url: str, max_pages: int = 1
                                 const txt = (el.textContent || "").toLowerCase();
                                 const dh = el.getAttribute && el.getAttribute("data-href");
                                 const oc = el.getAttribute && el.getAttribute("onclick") || "";
-                                if (/view\\s+details/.test(txt) || (dh && /\\/product\\//.test(dh)) or (/\\/product\\//.test(oc or ""))) {
+                                if (/view\\s+details/.test(txt) || (dh && /\\/product\\//.test(dh)) or (/\\/product\\//.test(oc || ""))) {
                                     if (el.href) out.add(el.href);
                                     if (dh) {
                                         try { out.add(new URL(dh, location.href).href); } catch {}
